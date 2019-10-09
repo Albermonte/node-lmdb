@@ -5,7 +5,6 @@
   "targets": [
     {
       "target_name": "node-lmdb",
-      "win_delay_load_hook": "false",
       "sources": [
         "dependencies/lmdb/libraries/liblmdb/mdb.c",
         "dependencies/lmdb/libraries/liblmdb/midl.c",
@@ -56,7 +55,22 @@
           }
         }],
         ["OS=='win'", {
-            "libraries": ["ntdll.lib"]
+            "libraries": ["ntdll.lib"],
+            "configurations": {
+              "Release": {
+                "msvs_settings": {
+                  "VCLinkerTool": {
+                    "AdditionalOptions": [
+                      "/LTCG:OFF"
+                    ]
+                  },
+                  "VCCLCompilerTool": {
+                    "Optimization": 0,
+                    "WholeProgramOptimization": "false"
+                  }
+                }
+              }
+            }
         }],
       ],
     }
