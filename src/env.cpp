@@ -116,6 +116,38 @@ class SyncWorker : public Nan::AsyncWorker {
     MDB_env* env;
 };
 
+class CopyWorker : public Nan::AsyncWorker {
+  public:
+    CopyWorker(MDB_env* env, char* inPath, int flags, Nan::Callback *callback)
+      : Nan::AsyncWorker(callback), env(env), flags(flags), path(strdup(inPath)) {
+      }
+    ~CopyWorker() {
+        free(path);
+    }
+
+    void Execute() {
+        int rc = mdb_env_copy2(env, path, flags);
+        if (rc != 0) {
+            fprintf(stderr, "Error on copy code: %u\n", rc);
+            SetErrorMessage("Error on copy");
+        }
+    }
+
+    void HandleOKCallback() {
+        Nan::HandleScope scope;
+        v8::Local<v8::Value> argv[] = {
+            Nan::Null()
+        };
+
+        callback->Call(1, argv, async_resource);
+    }
+
+  private:
+    MDB_env* env;
+    char* path;
+    int flags;
+};
+
 struct condition_t {
     MDB_val key;
     MDB_val data;
@@ -131,6 +163,8 @@ struct action_t {
     condition_t *condition;
     argtokey_callback_t freeKey;
 };
+
+int deleteValue; // pointer to this as the value represents a delete
 
 class BatchWorker : public Nan::AsyncProgressWorker {
   public:
@@ -172,7 +206,7 @@ class BatchWorker : public Nan::AsyncProgressWorker {
                 MDB_val value;
                 rc = mdb_get(txn, condition->dbi, &condition->key, &value);
                 bool different;
-                if (condition->data.mv_data == nullptr) {
+                if (condition->data.mv_data == &deleteValue) {
                     different = rc != MDB_NOTFOUND;
                 } else {
                     if (rc == MDB_NOTFOUND) {
@@ -195,7 +229,7 @@ class BatchWorker : public Nan::AsyncProgressWorker {
             if (condition) {
                 rc = 0; // make sure this gets set back to zero, failed conditions shouldn't trigger error
             } else {
-                if (action->data.mv_data == nullptr) {
+                if (action->data.mv_data == &deleteValue) {
                     rc = mdb_del(txn, action->dbi, &action->key, nullptr);
                     if (rc == MDB_NOTFOUND) {
                         rc = 0; // ignore not_found errors
@@ -436,6 +470,48 @@ NAN_METHOD(EnvWrap::info) {
     info.GetReturnValue().Set(obj);
 }
 
+NAN_METHOD(EnvWrap::copy) {
+    Nan::HandleScope scope;
+
+    // Get the wrapper
+    EnvWrap *ew = Nan::ObjectWrap::Unwrap<EnvWrap>(info.This());
+
+    if (!ew->env) {
+        return Nan::ThrowError("The environment is already closed.");
+    }
+
+    // Check that the correct number/type of arguments was given.
+    if (!info[0]->IsString()) {
+        return Nan::ThrowError("Call env.copy(path, compact?, callback) with a file path.");
+    }
+    if (!info[info.Length() - 1]->IsFunction()) {
+        return Nan::ThrowError("Call env.copy(path, compact?, callback) with a file path.");
+    }
+    Nan::Utf8String path(info[0].As<String>());
+
+    int flags = 0;
+    if (info.Length() > 1 && info[1]->IsTrue()) {
+        flags = MDB_CP_COMPACT;
+    }
+
+    Nan::Callback* callback = new Nan::Callback(
+      v8::Local<v8::Function>::Cast(info[info.Length()  > 2 ? 2 : 1])
+    );
+
+    CopyWorker* worker = new CopyWorker(
+      ew->env, *path, flags, callback
+    );
+
+    Nan::AsyncQueueWorker(worker);
+}
+
+NAN_METHOD(EnvWrap::detachBuffer) {
+    Nan::HandleScope scope;
+    #if NODE_VERSION_AT_LEAST(12,0,0)
+    Local<v8::ArrayBuffer>::Cast(info[0])->Detach();
+    #endif
+}
+
 NAN_METHOD(EnvWrap::beginTxn) {
     Nan::HandleScope scope;
 
@@ -575,8 +651,8 @@ NAN_METHOD(EnvWrap::batchWrite) {
             condition_t *condition = action->condition = new condition_t();
 
             if (ifValue->IsNull()) {
-                condition->data.mv_data = nullptr;
-            } else {
+                condition->data.mv_data = &deleteValue;
+            } else if (ifValue->IsArrayBufferView()) {
                 condition->data.mv_size = node::Buffer::Length(ifValue);
                 condition->data.mv_data = node::Buffer::Data(ifValue);
                 if (!isArray) {
@@ -585,6 +661,8 @@ NAN_METHOD(EnvWrap::batchWrite) {
                         condition->matchSize = true;
                     }
                 }
+            } else {
+                return Nan::ThrowError("The ifValue must be a buffer or null/undefined.");
             }
             if (isArray) {
                 condition->dbi = action->dbi;
@@ -593,11 +671,12 @@ NAN_METHOD(EnvWrap::batchWrite) {
                 v8::Local<v8::Value> ifDB = operation->Get(context, Nan::New<String>("ifDB").ToLocalChecked()).ToLocalChecked();
                 if (ifDB->IsNullOrUndefined()) {
                     condition->dbi = action->dbi;
-                } else {
+                } else if (ifDB->IsObject()) {
                     dw = Nan::ObjectWrap::Unwrap<DbiWrap>(v8::Local<v8::Object>::Cast((isArray ? operation->Get(context, 0) : operation->Get(Nan::GetCurrentContext(), Nan::New<String>("ifDB").ToLocalChecked())).ToLocalChecked()));
                     condition->dbi = dw->dbi;
+                } else {
+                    return Nan::ThrowError("The ifDB must be a database object or null/undefined.");
                 }
-
                 v8::Local<v8::Value> ifKey = operation->Get(context, Nan::New<String>("ifKey").ToLocalChecked()).ToLocalChecked();
                 if (ifKey->IsNullOrUndefined()) {
                     condition->key = action->key;
@@ -616,7 +695,7 @@ NAN_METHOD(EnvWrap::batchWrite) {
         }
 
         if (value->IsNullOrUndefined()) {
-            action->data.mv_data = nullptr;
+            action->data.mv_data = &deleteValue;
         } else if (value->IsArrayBufferView()) {
             action->data.mv_size = node::Buffer::Length(value);
             action->data.mv_data = node::Buffer::Data(value);
@@ -651,7 +730,8 @@ void EnvWrap::setupExports(Local<Object> exports) {
     envTpl->PrototypeTemplate()->Set(isolate, "stat", Nan::New<FunctionTemplate>(EnvWrap::stat));
     envTpl->PrototypeTemplate()->Set(isolate, "info", Nan::New<FunctionTemplate>(EnvWrap::info));
     envTpl->PrototypeTemplate()->Set(isolate, "resize", Nan::New<FunctionTemplate>(EnvWrap::resize));
-    // TODO: wrap mdb_env_copy too
+    envTpl->PrototypeTemplate()->Set(isolate, "copy", Nan::New<FunctionTemplate>(EnvWrap::copy));
+    envTpl->PrototypeTemplate()->Set(isolate, "detachBuffer", Nan::New<FunctionTemplate>(EnvWrap::detachBuffer));
 
     // TxnWrap: Prepare constructor template
     Local<FunctionTemplate> txnTpl = Nan::New<FunctionTemplate>(TxnWrap::ctor);

@@ -128,6 +128,11 @@ public:
     static NAN_METHOD(stat);
     
     /*
+        Detaches a buffer from the backing store
+    */
+    static NAN_METHOD(detachBuffer);
+
+    /*
         Gets information about the database environment.
     */
     static NAN_METHOD(info);
@@ -158,6 +163,18 @@ public:
         * maximal size of the memory map (the full environment) in bytes (default is 10485760 bytes)
     */
     static NAN_METHOD(resize);
+
+    /*
+        Copies the database environment to a file.
+        (Wrapper for `mdb_env_copy2`)
+
+        Parameters:
+
+        * path - Path to the target file
+        * compact (optional) - Copy using compact setting
+        * callback - Callback when finished (this is performed asynchronously)
+    */
+    static NAN_METHOD(copy);    
 
     /*
         Closes the database environment.
