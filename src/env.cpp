@@ -27,9 +27,18 @@ using namespace v8;
 using namespace node;
 
 #define IGNORE_NOTFOUND    (1)
-Nan::Persistent<Function> EnvWrap::txnCtor;
+thread_local Nan::Persistent<Function>* EnvWrap::txnCtor;
+thread_local Nan::Persistent<Function>* EnvWrap::dbiCtor;
+//Nan::Persistent<Function> EnvWrap::txnCtor;
+//Nan::Persistent<Function> EnvWrap::dbiCtor;
+uv_mutex_t* EnvWrap::envsLock = EnvWrap::initMutex();
+std::vector<env_path_t> EnvWrap::envs;
 
-Nan::Persistent<Function> EnvWrap::dbiCtor;
+uv_mutex_t* EnvWrap::initMutex() {
+    uv_mutex_t* mutex = new uv_mutex_t;
+    uv_mutex_init(mutex);
+    return mutex;
+}
 
 EnvWrap::EnvWrap() {
     this->env = nullptr;
@@ -82,7 +91,7 @@ int applyUint32Setting(int (*f)(MDB_env *, T), MDB_env* e, Local<Object> options
     int rc;
     const Local<Value> value = options->Get(Nan::GetCurrentContext(), Nan::New<String>(keyName).ToLocalChecked()).ToLocalChecked();
     if (value->IsUint32()) {
-        rc = f(e, value->Uint32Value(Nan::GetCurrentContext()).ToChecked());
+        rc = f(e, value->Uint32Value(Nan::GetCurrentContext()).FromJust());
     }
     else {
         rc = f(e, dflt);
@@ -207,10 +216,10 @@ class BatchWorker : public Nan::AsyncProgressWorker {
                 rc = mdb_get(txn, condition->dbi, &condition->key, &value);
                 bool different;
                 if (condition->data.mv_data == &deleteValue) {
-                    different = rc != MDB_NOTFOUND;
+                    different = !rc;
                 } else {
-                    if (rc == MDB_NOTFOUND) {
-                        different = true;
+                    if (rc) {
+                        different = rc == MDB_NOTFOUND;
                     } else {
                         different = (condition->matchSize ? value.mv_size != condition->data.mv_size : value.mv_size < condition->data.mv_size) ||
                         memcmp(value.mv_data, condition->data.mv_data, condition->data.mv_size);
@@ -223,6 +232,7 @@ class BatchWorker : public Nan::AsyncProgressWorker {
                     condition = nullptr;
                     results[i] = 0;
                 }
+                rc = 0;
             } else {
                 results[i] = 0;
             }
@@ -244,8 +254,12 @@ class BatchWorker : public Nan::AsyncProgressWorker {
                 action->freeKey(action->key);
             }
             if (rc != 0) {
-                mdb_txn_abort(txn);
-                return SetErrorMessage(mdb_strerror(rc));
+                if (rc == MDB_BAD_VALSIZE)
+                    results[i] = 3;
+                else {
+                    mdb_txn_abort(txn);
+                    return SetErrorMessage(mdb_strerror(rc));
+                }
             }
             i++;
             if (progress) { // let node know that progress updates are available
@@ -322,19 +336,33 @@ NAN_METHOD(EnvWrap::open) {
 
     Local<Object> options = Local<Object>::Cast(info[0]);
     Local<String> path = Local<String>::Cast(options->Get(Nan::GetCurrentContext(), Nan::New<String>("path").ToLocalChecked()).ToLocalChecked());
+    Nan::Utf8String charPath(path);
+    uv_mutex_lock(envsLock);
+    for (env_path_t envPath : envs) {
+        char* existingPath = envPath.path;
+        if (!strcmp(existingPath, *charPath)) {
+            envPath.count++;
+            mdb_env_close(ew->env);
+            ew->env = envPath.env;
+            uv_mutex_unlock(envsLock);
+            return;
+        }
+    }
 
     // Parse the maxDbs option
     rc = applyUint32Setting<unsigned>(&mdb_env_set_maxdbs, ew->env, options, 1, "maxDbs");
     if (rc != 0) {
+        uv_mutex_unlock(envsLock);
         return throwLmdbError(rc);
     }
 
     // Parse the mapSize option
     Local<Value> mapSizeOption = options->Get(Nan::GetCurrentContext(), Nan::New<String>("mapSize").ToLocalChecked()).ToLocalChecked();
     if (mapSizeOption->IsNumber()) {
-        size_t mapSizeSizeT = mapSizeOption->IntegerValue(Nan::GetCurrentContext()).ToChecked();
+        mdb_size_t mapSizeSizeT = mapSizeOption->IntegerValue(Nan::GetCurrentContext()).FromJust();
         rc = mdb_env_set_mapsize(ew->env, mapSizeSizeT);
         if (rc != 0) {
+            uv_mutex_unlock(envsLock);
             return throwLmdbError(rc);
         }
     }
@@ -351,6 +379,9 @@ NAN_METHOD(EnvWrap::open) {
     setFlagFromValue(&flags, MDB_NOSUBDIR, "noSubdir", false, options);
     setFlagFromValue(&flags, MDB_RDONLY, "readOnly", false, options);
     setFlagFromValue(&flags, MDB_WRITEMAP, "useWritemap", false, options);
+    setFlagFromValue(&flags, MDB_PREVSNAPSHOT, "usePreviousSnapshot", false, options);
+    setFlagFromValue(&flags, MDB_NOMEMINIT , "noMemInit", false, options);
+    setFlagFromValue(&flags, MDB_NORDAHEAD , "noReadAhead", false, options);
     setFlagFromValue(&flags, MDB_NOMETASYNC, "noMetaSync", false, options);
     setFlagFromValue(&flags, MDB_NOSYNC, "noSync", false, options);
     setFlagFromValue(&flags, MDB_MAPASYNC, "mapAsync", false, options);
@@ -364,13 +395,24 @@ NAN_METHOD(EnvWrap::open) {
     flags |= MDB_NOTLS;
 
     // TODO: make file attributes configurable
+    #if NODE_VERSION_AT_LEAST(12,0,0)
     rc = mdb_env_open(ew->env, *String::Utf8Value(Isolate::GetCurrent(), path), flags, 0664);
+    #else
+    rc = mdb_env_open(ew->env, *String::Utf8Value(path), flags, 0664);
+    #endif;
 
     if (rc != 0) {
         mdb_env_close(ew->env);
+        uv_mutex_unlock(envsLock);
         ew->env = nullptr;
         return throwLmdbError(rc);
     }
+    env_path_t envPath;
+    envPath.path = strdup(*charPath);
+    envPath.env = ew->env;
+    envPath.count = 1;
+    envs.push_back(envPath);
+    uv_mutex_unlock(envsLock);
 }
 
 NAN_METHOD(EnvWrap::resize) {
@@ -393,7 +435,7 @@ NAN_METHOD(EnvWrap::resize) {
         return Nan::ThrowError("Only call env.resize() when there are no active transactions. Please close all transactions before calling env.resize().");
     }
 
-    size_t mapSizeSizeT = info[0]->IntegerValue(Nan::GetCurrentContext()).ToChecked();
+    mdb_size_t mapSizeSizeT = info[0]->IntegerValue(Nan::GetCurrentContext()).FromJust();
     int rc = mdb_env_set_mapsize(ew->env, mapSizeSizeT);
     if (rc != 0) {
         return throwLmdbError(rc);
@@ -407,9 +449,23 @@ NAN_METHOD(EnvWrap::close) {
     if (!ew->env) {
         return Nan::ThrowError("The environment is already closed.");
     }
-
     ew->cleanupStrayTxns();
-    mdb_env_close(ew->env);
+
+    uv_mutex_lock(envsLock);
+    for (auto envPath = envs.begin(); envPath != envs.end(); ) {
+        if (envPath->env == ew->env) {
+            envPath->count--;
+            if (envPath->count <= 0) {
+                // last thread using it, we can really close it now
+                envs.erase(envPath);
+                mdb_env_close(ew->env);
+            }
+            break;
+        }
+        ++envPath;
+    }
+    uv_mutex_unlock(envsLock);
+
     ew->env = nullptr;
 }
 
@@ -518,7 +574,7 @@ NAN_METHOD(EnvWrap::beginTxn) {
     const int argc = 2;
 
     Local<Value> argv[argc] = { info.This(), info[0] };
-    Nan::MaybeLocal<Object> maybeInstance = Nan::NewInstance(Nan::New(txnCtor), argc, argv);
+    Nan::MaybeLocal<Object> maybeInstance = Nan::NewInstance(Nan::New(*txnCtor), argc, argv);
 
     // Check if txn could be created
     if ((maybeInstance.IsEmpty())) {
@@ -536,7 +592,7 @@ NAN_METHOD(EnvWrap::openDbi) {
 
     const unsigned argc = 2;
     Local<Value> argv[argc] = { info.This(), info[0] };
-    Nan::MaybeLocal<Object> maybeInstance = Nan::NewInstance(Nan::New(dbiCtor), argc, argv);
+    Nan::MaybeLocal<Object> maybeInstance = Nan::NewInstance(Nan::New(*dbiCtor), argc, argv);
 
     // Check if database could be opened
     if ((maybeInstance.IsEmpty())) {
@@ -669,7 +725,7 @@ NAN_METHOD(EnvWrap::batchWrite) {
                 condition->key = action->key;
             } else {
                 v8::Local<v8::Value> ifDB = operation->Get(context, Nan::New<String>("ifDB").ToLocalChecked()).ToLocalChecked();
-                if (ifDB->IsNullOrUndefined()) {
+                if (ifDB->IsNull() || ifDB->IsUndefined()) {
                     condition->dbi = action->dbi;
                 } else if (ifDB->IsObject()) {
                     dw = Nan::ObjectWrap::Unwrap<DbiWrap>(v8::Local<v8::Object>::Cast((isArray ? operation->Get(context, 0) : operation->Get(Nan::GetCurrentContext(), Nan::New<String>("ifDB").ToLocalChecked())).ToLocalChecked()));
@@ -678,7 +734,7 @@ NAN_METHOD(EnvWrap::batchWrite) {
                     return Nan::ThrowError("The ifDB must be a database object or null/undefined.");
                 }
                 v8::Local<v8::Value> ifKey = operation->Get(context, Nan::New<String>("ifKey").ToLocalChecked()).ToLocalChecked();
-                if (ifKey->IsNullOrUndefined()) {
+                if (ifKey->IsNull() || ifKey->IsUndefined()) {
                     condition->key = action->key;
                 } else {
                     condition->freeKey = argToKey(ifKey, condition->key, keyType, keyIsValid);
@@ -694,7 +750,7 @@ NAN_METHOD(EnvWrap::batchWrite) {
             action->condition = nullptr;
         }
 
-        if (value->IsNullOrUndefined()) {
+        if (value->IsNull() || value->IsUndefined()) {
             action->data.mv_data = &deleteValue;
         } else if (value->IsArrayBufferView()) {
             action->data.mv_size = node::Buffer::Length(value);
@@ -756,7 +812,8 @@ void EnvWrap::setupExports(Local<Object> exports) {
     // TODO: wrap mdb_cmp too
     // TODO: wrap mdb_dcmp too
     // TxnWrap: Get constructor
-    EnvWrap::txnCtor.Reset( txnTpl->GetFunction(Nan::GetCurrentContext()).ToLocalChecked());
+    EnvWrap::txnCtor = new Nan::Persistent<Function>();
+    EnvWrap::txnCtor->Reset( txnTpl->GetFunction(Nan::GetCurrentContext()).ToLocalChecked());
 
     // DbiWrap: Prepare constructor template
     Local<FunctionTemplate> dbiTpl = Nan::New<FunctionTemplate>(DbiWrap::ctor);
@@ -768,7 +825,8 @@ void EnvWrap::setupExports(Local<Object> exports) {
     dbiTpl->PrototypeTemplate()->Set(isolate, "stat", Nan::New<FunctionTemplate>(DbiWrap::stat));
     // TODO: wrap mdb_stat too
     // DbiWrap: Get constructor
-    EnvWrap::dbiCtor.Reset( dbiTpl->GetFunction(Nan::GetCurrentContext()).ToLocalChecked());
+    EnvWrap::dbiCtor = new Nan::Persistent<Function>();
+    EnvWrap::dbiCtor->Reset( dbiTpl->GetFunction(Nan::GetCurrentContext()).ToLocalChecked());
 
     // Set exports
     exports->Set(Nan::GetCurrentContext(), Nan::New<String>("Env").ToLocalChecked(), envTpl->GetFunction(Nan::GetCurrentContext()).ToLocalChecked());

@@ -32,11 +32,10 @@ describe('Node.js LMDB Bindings', function() {
         return done(err);
       }
       // setup clean directory
-      mkdirp(testBackupDirPath, function(err) {
-        if (err) {
-          return done(err);
-        }
+      mkdirp(testBackupDirPath).then(function() {
         done();
+      }, function(err) {
+        done(err);
       });
     });
   });
@@ -116,13 +115,20 @@ describe('Node.js LMDB Bindings', function() {
       });
       dbi.close();
     });
-    it('will open a database, begin a transaction and get/put/delete string data containing zeros', function() {
+    it.skip('will open a database, begin a transaction and get/put/delete string data containing zeros', function() {
       var dbi = env.openDbi({
         name: 'mydb1x',
         create: true
       });
-      var txn = env.beginTxn();
+//      dbi.close();
+      var txn = env.beginTxn({readOnly: true});
+  /*    var dbi = env.openDbi({
+        name: 'mydb1x',
+        //txn
+      });*/
       var data = txn.getString(dbi, 'hello');
+      txn.reset();
+      var txn = env.beginTxn();
       should.equal(data, null);
       txn.putString(dbi, 'hello', 'Hello \0 world!');
       var data2 = txn.getString(dbi, 'hello');
@@ -991,6 +997,22 @@ describe('Node.js LMDB Bindings', function() {
     this.timeout(10000);
     it('will run a cluster of processes with read-only transactions', function(done) {
       var child = spawn('node', [path.resolve(__dirname, './cluster')]);
+      child.stdout.on('data', function(data) {
+        console.log(data.toString());
+      });
+      child.stderr.on('data', function(data) {
+        console.error(data.toString());
+      });
+      child.on('close', function(code) {
+        code.should.equal(0);
+        done();
+      });
+    });
+  });
+  describe('Threads', function() {
+    this.timeout(10000);
+    it('will run a group of threads with read-only transactions', function(done) {
+      var child = spawn('node', [path.resolve(__dirname, './threads')]);
       child.stdout.on('data', function(data) {
         console.log(data.toString());
       });

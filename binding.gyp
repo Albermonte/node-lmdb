@@ -1,6 +1,9 @@
 {
   "variables": {
       "os_linux_compiler%": "gcc",
+      "use_vl32%": "false",
+      "use_fixed_size%": "false",
+      "use_posix_semaphores%": "false"
   },
   "targets": [
     {
@@ -15,7 +18,6 @@
         "src/dbi.cpp",
         "src/cursor.cpp"
       ],
-      "defines": ["MDB_FIXEDSIZE"],
       "include_dirs": [
         "<!(node -e \"require('nan')\")",
         "dependencies/lmdb/libraries/liblmdb"
@@ -44,14 +46,18 @@
             "-fPIC",
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
-            "-std=c++0x"
           ]
         }],
         ["OS=='mac'", {
+          "conditions": [
+            ["use_posix_semaphores=='true'", {
+              "defines": ["MDB_USE_POSIX_SEM"]
+            }]
+          ],
           "xcode_settings": {
-            "OTHER_CPLUSPLUSFLAGS" : ["-std=c++11"],
+            "OTHER_CPLUSPLUSFLAGS" : ["-std=c++14"],
             "MACOSX_DEPLOYMENT_TARGET": "10.7",
-            "OTHER_LDFLAGS": ["-std=c++11"],
+            "OTHER_LDFLAGS": ["-std=c++14"],
             "CLANG_CXX_LIBRARY": "libc++"
           }
         }],
@@ -72,6 +78,16 @@
                 }
               }
             }
+        }],
+        ["use_fixed_size=='true'", {
+          "defines": ["MDB_FIXEDSIZE"],
+        }],
+        ["use_vl32=='true'", {
+          "conditions": [
+            ["target_arch=='ia32'", {
+                "defines": ["MDB_VL32"]
+              }]
+            ]
         }],
       ],
     }
